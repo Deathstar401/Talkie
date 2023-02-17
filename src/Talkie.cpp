@@ -130,6 +130,10 @@ static hw_timer_t *sTalkieSampleRateTimer = NULL;
 static void tcStart(uint32_t sampleRate); // TC5
 static void tcEnd();
 
+#elif defined(ARDUINO_ARCH_MBED_NANO) // Zero
+static void tcStart(uint32_t sampleRate); // TC5
+static void tcEnd();
+
 #elif defined(__STM32F1__) || defined(ARDUINO_ARCH_STM32F1)
 #include <HardwareTimer.h> // 4 timers and 4. timer (4.channel) is used for tone()
 /*
@@ -293,6 +297,25 @@ void Talkie::initializeHardware() {
     analogWrite(sPointerToTalkieForISR->NonInvertedOutputPin, 1 << 9); // DAC0
     tcStart(SAMPLE_RATE);
 
+
+
+#elif defined(ARDUINO_ARCH_MBED_NANO) // Zero
+#define _10_BIT_OUTPUT // 10-bit, 350 ksps Digital-to-Analog Converter (DAC)
+#if defined DAC0
+#define DAC_PIN DAC0   // pin 14/A0 for Zero. PA02 + DAC1 on DUE
+#else
+#define DAC_PIN A0   // On some SAMD boards DAC0 definition is missing
+#endif
+#define PWM_OUTPUT_FUNCTION(nextPwm) analogWrite(sPointerToTalkieForISR->NonInvertedOutputPin, nextPwm)
+#  if defined(ARDUINO_MBED_OS_NANO_RP2040_CONNECT)
+    static const int CPLAY_SPEAKER_SHUTDOWN= 11;
+    pinMode(CPLAY_SPEAKER_SHUTDOWN, OUTPUT);
+    digitalWrite(CPLAY_SPEAKER_SHUTDOWN, HIGH);
+#  endif
+    analogWriteResolution(10); // 10-bit, 350 ksps Digital-to-Analog Converter (DAC)
+    analogWrite(sPointerToTalkieForISR->NonInvertedOutputPin, 1 << 9); // DAC0
+    tcStart(SAMPLE_RATE);
+
 #elif defined(TEENSYDUINO)
     // common for all Teensy
 #define _12_BIT_OUTPUT
@@ -438,6 +461,9 @@ void Talkie::terminateHardware() {
     }
 
     #elif defined(ARDUINO_ARCH_SAMD) // Zero
+    tcEnd();
+
+    #elif defined(ARDUINO_ARCH_MBED_NANO) // Zero
     tcEnd();
 
 #elif defined(ESP32)
@@ -873,11 +899,19 @@ void timerInterrupt() {
     TC5->COUNT16.INTFLAG.bit.MC0 = 1;
 #endif
 
+#if defined(ARDUINO_ARCH_MBED_NANO)
+    TC5->COUNT16.INTFLAG.bit.MC0 = 1;
+#endif
+
 #if defined(MEASURE_TIMING)
     digitalWriteFast(TIMING_PIN, LOW);
 #endif
 }
 #if defined(ARDUINO_ARCH_SAMD)
+void TC5_Handler(void) __attribute__ ((weak, alias("timerInterrupt")));
+#endif
+
+#if defined(ARDUINO_ARCH_MBED_NANO)
 void TC5_Handler(void) __attribute__ ((weak, alias("timerInterrupt")));
 #endif
 
@@ -953,6 +987,57 @@ static void setNextSynthesizerData() {
 }
 
 #if defined(ARDUINO_ARCH_SAMD)
+static void tcReset() {
+    // Reset TCx
+    TC5->COUNT16.CTRLA.reg = TC_CTRLA_SWRST;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY)
+        ;
+    while (TC5->COUNT16.CTRLA.bit.SWRST)
+        ;
+}
+
+static void tcEnd() {
+    // Disable TC5
+    TC5->COUNT16.CTRLA.reg &= ~TC_CTRLA_ENABLE;
+    tcReset();
+#if defined _10_BIT_OUTPUT
+    PWM_OUTPUT_FUNCTION(0x200);
+#elif defined(_12_BIT_OUTPUT)
+    PWM_OUTPUT_FUNCTION(0x800);
+#endif
+}
+
+static void tcStart(uint32_t sampleRate) {
+// Enable GCLK for TCC2 and TC5 (timer counter input clock)
+    GCLK->CLKCTRL.reg = (uint16_t) (GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_ID(GCM_TC4_TC5)); // GCLK1=32kHz,  GCLK0=48MHz
+    //    while (GCLK->STATUS.bit.SYNCBUSY) // not required to wait
+    //        ;
+    tcReset();
+
+// Set Timer counter Mode to 16 bits, Set TC5 mode as match frequency
+    TC5->COUNT16.CTRLA.reg |= TC_CTRLA_MODE_COUNT16 | TC_CTRLA_WAVEGEN_MFRQ | TC_CTRLA_PRESCALER_DIV1 | TC_CTRLA_ENABLE;
+    TC5->COUNT16.CC[0].reg = (uint16_t) (SystemCoreClock / sampleRate - 1);
+    //    while (TC5->COUNT16.STATUS.reg & TC_STATUS_SYNCBUSY) // The next commands do an implicit wait :-)
+    //        ;
+
+// Configure interrupt request
+    NVIC_DisableIRQ(TC5_IRQn);
+    NVIC_ClearPendingIRQ(TC5_IRQn);
+    NVIC_SetPriority(TC5_IRQn, 0);
+    NVIC_EnableIRQ(TC5_IRQn);
+
+// Enable the TC5 interrupt request
+    TC5->COUNT16.INTENSET.bit.MC0 = 1;
+
+    TC5->COUNT16.CTRLA.reg |= TC_CTRLA_ENABLE;
+    //    while (TC5->COUNT16.STATUS.reg & TC_STATUS_SYNCBUSY) // Not required to wait at end of function
+    //        ; // wait until TC5 is done syncing
+}
+
+#endif
+
+
+#if defined(ARDUINO_ARCH_MBED_NANO)
 static void tcReset() {
     // Reset TCx
     TC5->COUNT16.CTRLA.reg = TC_CTRLA_SWRST;
